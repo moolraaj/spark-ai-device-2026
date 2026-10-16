@@ -103,7 +103,7 @@ bool slcConnected      = false;
 volatile bool audioConnecting   = false;
 volatile bool audioConnected    = false;
 bool callIncoming      = false;
-volatile bool callActive = false;
+bool callActive        = false;
 bool remoteDeviceKnown = false;
 esp_bd_addr_t remoteDevice = {0};
 
@@ -131,17 +131,17 @@ const unsigned long AUDIO_RECONNECT_INTERVAL = 3000;
 // ============================================================
 // RINGS
 // ============================================================
-#define AUDIO_RING_SIZE_HEAP    8192
+#define AUDIO_RING_SIZE_HEAP    6144
 #define AUDIO_RING_SIZE_PSRAM   16384
 #define TX_RING_SIZE_HEAP       12288
 #define TX_RING_SIZE_PSRAM      16384
 
 #define AUDIO_SEND_CHUNK  960
 #define AUDIO_SEND_MIN    480
-#define TX_PREBUFFER_MS   450
-#define TX_REBUFFER_MS    180
-// Barge-in requires continuous microphone upload during AI playback.
-#define TTS_PAUSE_MIC_UPLOAD 0
+#define TX_PREBUFFER_MS   300
+// Stable half-duplex: discard microphone audio while AI PCM is queued.
+// Set to 0 only to test full-duplex/barge-in after verifying transport stability.
+#define TTS_PAUSE_MIC_UPLOAD 1
 
 uint8_t*  audioRing     = nullptr;
 uint32_t  audioRingSize = AUDIO_RING_SIZE_HEAP;
@@ -165,8 +165,6 @@ volatile uint32_t maxLoopMs    = 0;
 volatile bool pendingCallStarted  = false;
 volatile bool pendingCallEnded    = false;
 volatile bool pendingAudioFormat  = false;
-volatile bool pendingAudioStopped = false;
-volatile bool unsupportedCodec = false;
 volatile bool callResumed         = false;
 volatile int  audioSampleRate     = 8000;
 const char*   audioCodecName      = "CVSD";
@@ -177,7 +175,6 @@ portMUX_TYPE txRingMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE audioRingMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile bool     txPlaying   = false;
-volatile bool     txRebuffering = false;
 volatile uint32_t txLastRxMs  = 0;
 
 volatile bool txStreamEnded = false;
@@ -439,7 +436,6 @@ void txRingClear()
     portENTER_CRITICAL(&txRingMux);
     txRingTail = txRingHead;
     txPlaying = false;
-    txRebuffering = false;
     txStreamEnded = false;
     txStreamActive = false;
     txPlaybackDonePending = false;
@@ -568,11 +564,17 @@ void hfpDataCallback(const uint8_t* buf, uint32_t len)
   audioCallbackCount++;
   audioRxBytes += len;
 
-  // Only the HFP audio-state event establishes the negotiated codec.
+  // GROUND TRUTH: if SCO data is flowing during a call, SCO is up.
+  if (callActive && !audioConnected)
+  {
+    audioConnecting    = false;
+    audioConnected     = true;
+    pendingAudioFormat = true;   // -> audio_format goes to backend
+    dbgScoInferred     = true;   // printed later from loop()
+  }
 
 #if TTS_PAUSE_MIC_UPLOAD
-  if (callActive && audioConnected && !unsupportedCodec &&
-      !txStreamActive && !txPlaybackDonePending) ringWrite(buf, len);
+  if (!txStreamActive) ringWrite(buf, len);
 #else
   ringWrite(buf, len);
 #endif
@@ -595,9 +597,7 @@ uint32_t hfpOutgoingCallback(uint8_t* buf, uint32_t len)
     }
 
     const uint32_t now = millis();
-    const uint32_t prebuffer = txRebuffering
-        ? (uint32_t)audioSampleRate * 2 * TX_REBUFFER_MS / 1000
-        : txPrebufferBytes();
+    const uint32_t prebuffer = txPrebufferBytes();
 
     portENTER_CRITICAL(&txRingMux);
 
@@ -616,7 +616,6 @@ uint32_t hfpOutgoingCallback(uint8_t* buf, uint32_t len)
         }
 
         txPlaying = true;
-        txRebuffering = false;
         aiTtsActive = true;
         aiTtsStartTime = now;
         dbgTtsStarted = true;
@@ -652,9 +651,8 @@ uint32_t hfpOutgoingCallback(uint8_t* buf, uint32_t len)
         txUnderruns++;
         txStreamUnderruns++;
 
-        // Short recovery buffer; do not repeat the full startup buffer.
-        txRebuffering = true;
-        txPlaying = false;
+        // Re-enter prebuffer mode before playing more PCM.
+        // txPlaying = false;
     }
 
     if (txStreamEnded && txRingAvailableUnsafe() == 0) {
@@ -912,25 +910,23 @@ void sendPlaybackFeedback()
     uint32_t capacity = (txRingSize - 1) & ~1u;
     bool failed = txStreamFailed;
     portEXIT_CRITICAL(&txRingMux);
-    if (!done && (!active || (now - lastBufferReportMs < 60))) return;
-    uint8_t packet[WEBSOCKETS_MAX_HEADER_SIZE + 256];
-    char* event = (char*)packet + WEBSOCKETS_MAX_HEADER_SIZE;
+    if (!done && (!active || (now - lastBufferReportMs < 100))) return;
+    char event[256];
     if (done) {
-        snprintf(event, 256,
+        snprintf(event, sizeof(event),
             "{\"event\":\"ai_audio_played\",\"playback_id\":%lu,"
-            "\"played\":%lu,\"received\":%lu,\"dropped\":%lu,\"underruns\":%lu,\"ok\":%s}",
+            "\"played\":%lu,\"received\":%lu,\"dropped\":%lu,\"ok\":%s}",
             (unsigned long)id, (unsigned long)played,
-            (unsigned long)received, (unsigned long)dropped, (unsigned long)underruns,
+            (unsigned long)received, (unsigned long)dropped,
             failed ? "false" : "true");
     } else {
-        snprintf(event, 256,
+        snprintf(event, sizeof(event),
             "{\"event\":\"ai_audio_buffer\",\"playback_id\":%lu,"
             "\"played\":%lu,\"received\":%lu,\"capacity\":%lu}",
             (unsigned long)id, (unsigned long)played,
             (unsigned long)received, (unsigned long)capacity);
     }
-    // Reserve header space to avoid a per-report heap allocation.
-    if (webSocket.sendTXT(packet, strlen(event), true)) {
+    if (webSocket.sendTXT(event)) {
         lastBufferReportMs = now;
         if (done) {
             portENTER_CRITICAL(&txRingMux);
@@ -942,9 +938,6 @@ void sendPlaybackFeedback()
                 (unsigned long)id, (unsigned long)played,
                 (unsigned long)received, (unsigned long)dropped, (unsigned long)underruns, !failed);
         }
-    } else {
-        // A partial control frame cannot safely be retried on the same socket.
-        webSocket.disconnect();
     }
 }
 
@@ -1191,13 +1184,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length)
         // Generic call reset uses no ID; stale stream-specific cancel is ignored.
         if (!id || id == txPlaybackId) {
             txRingClear();
-            // Preserve user microphone audio during interruption.
-            uint32_t generation = jsonUInt(message, "generation");
-            char ack[128];
-            snprintf(ack, sizeof(ack), "{\"event\":\"ai_audio_cancelled\",\"generation\":%lu,\"playback_id\":%lu}",
-                     (unsigned long)generation, (unsigned long)txPlaybackId);
-            Serial.printf("[BARGE DEVICE STOP] generation=%lu AI ring cleared\n", (unsigned long)generation);
-            webSocket.sendTXT(ack);
+            ringClear();
         }
         break;
     }
@@ -1362,13 +1349,6 @@ void hfpCallback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param
       }
       else if (state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED)
       {
-        if (callActive) pendingCallEnded = true;
-        pendingAudioStopped = true;
-        pendingCallStarted = false;
-        pendingAudioFormat = false;
-        unsupportedCodec = false;
-        ringClear();
-        txRingClear();
         hfpConnected      = false;
         slcConnected      = false;
         audioConnecting   = false;
@@ -1400,7 +1380,6 @@ void hfpCallback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param
       {
         audioConnecting = false;
         audioConnected  = true;
-        unsupportedCodec = false;
         audioSampleRate = 8000;
         audioCodecName  = "CVSD";
         lastCbMs = 0; maxCbGapMs = 0; bigGapCount = 0;
@@ -1416,27 +1395,31 @@ void hfpCallback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param
         aiResponseBytes = 0;
         aiResponseChunks = 0;
       }
-      else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC)
-      {
-        unsupportedCodec = true;
-        audioConnected = false;
-        audioConnecting = false;
-        pendingAudioFormat = false;
-        pendingAudioStopped = true;
-        ringClear();
-        txRingClear();
-        // Reject wideband audio instead of silently treating it as 8 kHz.
-        esp_hf_client_disconnect_audio(remoteDevice);
-        Serial.println("CVSD REQUIRED: disable CONFIG_BT_HFP_WBS_ENABLE in the actual SDK build, rebuild and re-pair.");
-      }
+      // else if (state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC)
+      // {
+      //   audioConnecting = false;
+      //   audioConnected  = true;
+      //   audioSampleRate = 16000;
+      //   audioCodecName  = "mSBC";
+      //   lastCbMs = 0; maxCbGapMs = 0; bigGapCount = 0;
+      //   ringClear();
+      //   txRingClear();
+      //   pendingAudioFormat = true;
+      //   Serial.println("SCO AUDIO CONNECTED | Codec: mSBC | 16000 Hz");
+      //   Serial.println("⚠️ mSBC/WBS negotiated. This firmware sends raw callback bytes as PCM, so mSBC must be DISABLED in build config.");
+      //   Serial.println("   Set CONFIG_BT_HFP_WBS_ENABLE=n, rebuild, erase flash/NVS if needed, then pair again.");
+      //   printAIActivityBanner("VOICE CHANNEL OPEN (mSBC - NOT SUPPORTED IN THIS BUILD)");
+      //   logAI("🎤", "AI-LISTEN", "SCO audio connected - AI can now hear you");
+      //   aiListening = true;
+      //   aiUserSpeechBytes = 0;
+      //   aiUserSpeechChunks = 0;
+      //   aiResponseBytes = 0;
+      //   aiResponseChunks = 0;
+      // }
       else if (state == ESP_HF_CLIENT_AUDIO_STATE_DISCONNECTED)
       {
         audioConnecting = false;
         audioConnected  = false;
-        pendingAudioStopped = true;
-        pendingAudioFormat = false;
-        ringClear();
-        txRingClear();
         Serial.println("SCO AUDIO DISCONNECTED");
         logAI("🔇", "AI-LISTEN", "SCO audio disconnected");
         aiListening = false;
@@ -1478,7 +1461,6 @@ void hfpCallback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param
     {
       if (param->call.status == ESP_HF_CALL_STATUS_CALL_IN_PROGRESS)
       {
-        ringClear();
         callActive         = true;
         autoAnswerPending  = false;
         callAnswered       = true;
@@ -1508,11 +1490,6 @@ void hfpCallback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param
         callerPhoneNumber[0] = '\0';
 
         if (wasActive) pendingCallEnded = true;
-        unsupportedCodec = false;
-        pendingCallStarted = false;
-        pendingAudioFormat = false;
-        ringClear();
-        txRingClear();
 
         Serial.println();
         Serial.println("CALL ENDED");
@@ -1644,7 +1621,6 @@ void connectHFP()
 // ============================================================
 void connectSCO()
 {
-  if (unsupportedCodec) return;
   if (!slcConnected || !callActive || audioConnected || !remoteDeviceKnown) return;
 
   unsigned long now = millis();
@@ -1675,16 +1651,6 @@ void connectSCO()
 
 void handlePendingEvents()
 {
-    if (backendConnected && pendingAudioStopped) {
-        if (webSocket.sendTXT("{\"event\":\"call_audio_stopped\"}")) {
-            pendingAudioStopped = false;
-        } else {
-            webSocket.disconnect();
-            return;
-        }
-    }
-
-
     if (!backendConnected) return;
 
     static char evtBuf[256];
@@ -1884,43 +1850,19 @@ void handleAudioStreaming()
         return;
     }
 #endif
-    // Signal a discontinuity before sending more PCM: concatenating audio
-    // across an overflow produces misleading STT input.
-    static uint32_t reportedDrops = 0;
-    uint32_t dropped = audioDroppedBytes;
-    if (dropped != reportedDrops) {
-        ringClear();
-        char event[96];
-        snprintf(event, sizeof(event), "{\"event\":\"mic_gap\",\"dropped\":%lu}",
-                 (unsigned long)(dropped - reportedDrops));
-        if (!webSocket.sendTXT(event)) {
-            audioSendFailures++;
-            webSocket.disconnect();
-            return;
-        }
-        reportedDrops = dropped;
-        return;
-    }
-    static uint8_t packet[WEBSOCKETS_MAX_HEADER_SIZE + AUDIO_SEND_CHUNK];
-    uint8_t* chunk = packet + WEBSOCKETS_MAX_HEADER_SIZE;
+    static uint8_t chunk[AUDIO_SEND_CHUNK];
     uint32_t avail = ringAvailable() & ~1u;
     if (avail < AUDIO_SEND_MIN) return;
     uint32_t n = ringPeek(chunk, min(avail, (uint32_t)AUDIO_SEND_CHUNK)) & ~1u;
     if (!n) return;
     // One write per loop; all WebSocket access stays on this same task.
-    if (webSocket.sendBIN(packet, n, true)) {
+    if (webSocket.sendBIN(chunk, n)) {
         ringDiscard(n);
         audioSentBytes += n;
         audioSentFrames++;
         aiUserSpeechBytes += n;
         aiUserSpeechChunks++;
         aiLastUserSpeechMs = millis();
-    } else {
-        // A failed write may have sent part of the frame. Do not retry a
-        // whole frame on the same TCP stream; reconnect before resuming.
-        audioSendFailures++;
-        ringClear();
-        webSocket.disconnect();
     }
 }
 
@@ -1932,7 +1874,6 @@ void setupBluetooth()
 {
   Serial.println();
   Serial.println("STARTING BLUETOOTH");
-  Serial.printf("[VOICE BUILD] barge-v5 TTS_PAUSE_MIC_UPLOAD=%d\n", TTS_PAUSE_MIC_UPLOAD);
   Serial.printf("Free heap before BT: %u\n", ESP.getFreeHeap());
 
   if (!btStarted())
